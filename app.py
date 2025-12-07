@@ -43,6 +43,8 @@ if 'selected_month' not in st.session_state:
     st.session_state.selected_month = datetime.now().month
 if 'selected_year' not in st.session_state:
     st.session_state.selected_year = datetime.now().year
+if 'base_milk_cost' not in st.session_state:
+    st.session_state.base_milk_cost = 104.00
 
 # Initialize Database
 def init_database():
@@ -56,6 +58,7 @@ def init_database():
             user_id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT UNIQUE NOT NULL,
             password_hash TEXT NOT NULL,
+            base_milk_cost REAL DEFAULT 104.00,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
@@ -116,7 +119,7 @@ def init_database():
     # Insert default demo user if not exists
     cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'demo'")
     if cursor.fetchone()[0] == 0:
-        cursor.execute("INSERT INTO users (username, password_hash) VALUES ('demo', 'demo')")
+        cursor.execute("INSERT INTO users (username, password_hash, base_milk_cost) VALUES ('demo', 'demo', 104.00)")
     
     conn.commit()
     conn.close()
@@ -159,14 +162,38 @@ def get_user_details(user_id):
     if conn:
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
+            cursor.execute("SELECT username, base_milk_cost FROM users WHERE user_id = ?", (user_id,))
             result = cursor.fetchone()
             conn.close()
-            return result['username'] if result else None
+            if result:
+                return {
+                    'username': result['username'],
+                    'base_milk_cost': result['base_milk_cost']
+                }
+            return None
         except Exception as e:
             st.error(f"Error fetching user details: {e}")
             return None
     return None
+
+# Update user base milk cost
+def update_base_milk_cost(user_id, new_cost):
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("""
+                UPDATE users 
+                SET base_milk_cost = ?, updated_at = CURRENT_TIMESTAMP 
+                WHERE user_id = ?
+            """, (new_cost, user_id))
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Error updating base milk cost: {e}")
+            return False
+    return False
 
 # Update user password
 def update_password(user_id, new_password):
@@ -188,13 +215,13 @@ def update_password(user_id, new_password):
     return False
 
 # Create new user
-def create_user(username, password):
+def create_user(username, password, base_milk_cost=104.00):
     conn = get_db_connection()
     if conn:
         try:
             cursor = conn.cursor()
-            cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", 
-                         (username, password))
+            cursor.execute("INSERT INTO users (username, password_hash, base_milk_cost) VALUES (?, ?, ?)", 
+                         (username, password, base_milk_cost))
             conn.commit()
             conn.close()
             return True
@@ -230,19 +257,27 @@ def get_milk_records(user_id, month, year):
     return pd.DataFrame()
 
 # Initialize milk records for a month
-def initialize_month_records(user_id, month, year):
+def initialize_month_records(user_id, month, year, base_cost=None):
     conn = get_db_connection()
     if conn:
         try:
+            # Get user's base milk cost if not provided
+            if base_cost is None:
+                cursor = conn.cursor()
+                cursor.execute("SELECT base_milk_cost FROM users WHERE user_id = ?", (user_id,))
+                result = cursor.fetchone()
+                base_cost = result['base_milk_cost'] if result else 104.00
+            
             cursor = conn.cursor()
             num_days = calendar.monthrange(year, month)[1]
             
             for day in range(1, num_days + 1):
                 record_date = datetime(year, month, day).date()
+                # Set is_taken to 0 (False) by default - user must mark days they took milk
                 cursor.execute("""
                     INSERT OR IGNORE INTO milk_records (user_id, record_date, is_taken, base_cost, additional_cost)
-                    VALUES (?, ?, 1, 104.00, 0.00)
-                """, (user_id, record_date))
+                    VALUES (?, ?, 0, ?, 0.00)
+                """, (user_id, record_date, base_cost))
             
             conn.commit()
             conn.close()
@@ -253,16 +288,16 @@ def initialize_month_records(user_id, month, year):
     return False
 
 # Update milk record
-def update_milk_record(record_id, is_taken, additional_cost, notes):
+def update_milk_record(record_id, is_taken, base_cost, additional_cost, notes):
     conn = get_db_connection()
     if conn:
         try:
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE milk_records 
-                SET is_taken = ?, additional_cost = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
+                SET is_taken = ?, base_cost = ?, additional_cost = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE record_id = ?
-            """, (1 if is_taken else 0, additional_cost, notes, record_id))
+            """, (1 if is_taken else 0, base_cost, additional_cost, notes, record_id))
             conn.commit()
             conn.close()
             return True
@@ -400,6 +435,12 @@ def login_page():
                         st.session_state.logged_in = True
                         st.session_state.user_id = user_id
                         st.session_state.username = username
+                        
+                        # Load user's base milk cost
+                        user_details = get_user_details(user_id)
+                        if user_details:
+                            st.session_state.base_milk_cost = user_details['base_milk_cost']
+                        
                         st.success("Login successful!")
                         st.rerun()
                     else:
@@ -424,6 +465,7 @@ def registration_page():
         new_username = st.text_input("New Username")
         new_password = st.text_input("New Password", type="password")
         confirm_password = st.text_input("Confirm Password", type="password")
+        base_milk_cost = st.number_input("Daily Milk Cost (₹)", min_value=0.0, value=104.0, step=1.0)
         
         col_reg, col_back = st.columns(2)
         
@@ -431,7 +473,7 @@ def registration_page():
             if st.button("Register", use_container_width=True):
                 if new_username and new_password and confirm_password:
                     if new_password == confirm_password:
-                        if create_user(new_username, new_password):
+                        if create_user(new_username, new_password, base_milk_cost):
                             st.success("User registered successfully! Please login.")
                             st.session_state.show_register = False
                             st.rerun()
@@ -472,6 +514,12 @@ def main_app():
 def monthly_records_page():
     st.header("Monthly Milk Records")
     
+    # Display current base milk cost
+    user_details = get_user_details(st.session_state.user_id)
+    if user_details:
+        current_cost = user_details['base_milk_cost']
+        st.info(f"💰 Your current daily milk cost: ₹{current_cost:.2f}")
+    
     # Month and Year selection
     col1, col2, col3 = st.columns([2, 2, 1])
     
@@ -506,7 +554,7 @@ def monthly_records_page():
         # Display records in an editable format
         for idx, row in df.iterrows():
             with st.expander(f"📅 {row['record_date'].strftime('%d %B %Y')} - ₹{row['total_cost']:.2f}"):
-                col1, col2, col3 = st.columns([2, 2, 2])
+                col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
                 
                 with col1:
                     is_taken = st.checkbox("Milk Taken", 
@@ -514,18 +562,26 @@ def monthly_records_page():
                                           key=f"taken_{row['record_id']}")
                 
                 with col2:
+                    base_cost = st.number_input("Base Cost (₹)", 
+                                               value=float(row['base_cost']), 
+                                               min_value=0.0,
+                                               step=1.0,
+                                               key=f"base_{row['record_id']}")
+                
+                with col3:
                     additional_cost = st.number_input("Additional Cost (₹)", 
                                                      value=float(row['additional_cost']), 
                                                      min_value=0.0,
+                                                     step=1.0,
                                                      key=f"add_{row['record_id']}")
                 
-                with col3:
+                with col4:
                     notes = st.text_input("Notes", 
                                         value=row['notes'] if pd.notna(row['notes']) else "", 
                                         key=f"notes_{row['record_id']}")
                 
                 if st.button("Update", key=f"update_{row['record_id']}"):
-                    if update_milk_record(row['record_id'], is_taken, additional_cost, notes):
+                    if update_milk_record(row['record_id'], is_taken, base_cost, additional_cost, notes):
                         st.success("Record updated!")
                         st.rerun()
         
@@ -549,6 +605,33 @@ def monthly_records_page():
 def user_settings_page():
     st.header("User Settings")
     
+    # Update Default Milk Cost
+    st.subheader("Update Default Milk Cost")
+    
+    col1, col2, col3 = st.columns([1, 2, 1])
+    
+    with col2:
+        user_details = get_user_details(st.session_state.user_id)
+        current_cost = user_details['base_milk_cost'] if user_details else 104.00
+        
+        st.info(f"Current daily milk cost: ₹{current_cost:.2f}")
+        
+        new_milk_cost = st.number_input("New Daily Milk Cost (₹)", 
+                                        min_value=0.0, 
+                                        value=float(current_cost), 
+                                        step=1.0)
+        
+        if st.button("Update Milk Cost", use_container_width=True):
+            if update_base_milk_cost(st.session_state.user_id, new_milk_cost):
+                st.session_state.base_milk_cost = new_milk_cost
+                st.success(f"Milk cost updated to ₹{new_milk_cost:.2f}!")
+                st.info("Note: This will apply to newly initialized months. Existing records remain unchanged.")
+            else:
+                st.error("Failed to update milk cost")
+    
+    st.divider()
+    
+    # Change Password
     st.subheader("Change Password")
     
     col1, col2, col3 = st.columns([1, 2, 1])
