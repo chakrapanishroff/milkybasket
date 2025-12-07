@@ -1,17 +1,36 @@
 import streamlit as st
 import pandas as pd
-import pyodbc
+import sqlite3
 from datetime import datetime, timedelta
 import calendar
 import hashlib
-from groq import Groq
 import os
 
-# Database configuration
-DATABASE_NAME = 'MilkCalculationDB'
+# Load environment variables for local development
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # dotenv not required on Streamlit Cloud
 
-# GROQ API Configuration
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+# Try to import groq, but handle if it's not installed
+try:
+    from groq import Groq
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
+    Groq = None
+
+# Database configuration
+DATABASE_NAME = 'milk_calculation.db'
+
+# GROQ API Configuration - Support both Streamlit Cloud secrets and local .env
+try:
+    # Try Streamlit Cloud secrets first
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except:
+    # Fallback to environment variable for local development
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 # Initialize session state
 if 'logged_in' not in st.session_state:
@@ -25,18 +44,88 @@ if 'selected_month' not in st.session_state:
 if 'selected_year' not in st.session_state:
     st.session_state.selected_year = datetime.now().year
 
+# Initialize Database
+def init_database():
+    """Initialize SQLite database and create tables if they don't exist"""
+    conn = sqlite3.connect(DATABASE_NAME)
+    cursor = conn.cursor()
+    
+    # Create users table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    
+    # Create milk_records table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS milk_records (
+            record_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            record_date DATE NOT NULL,
+            is_taken INTEGER DEFAULT 1,
+            base_cost REAL DEFAULT 104.00,
+            additional_cost REAL DEFAULT 0.00,
+            total_cost REAL GENERATED ALWAYS AS (
+                CASE WHEN is_taken = 1 THEN base_cost + additional_cost ELSE 0 END
+            ) STORED,
+            notes TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            UNIQUE(user_id, record_date)
+        )
+    """)
+    
+    # Create monthly_summary table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS monthly_summary (
+            summary_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            month INTEGER NOT NULL CHECK (month BETWEEN 1 AND 12),
+            year INTEGER NOT NULL CHECK (year BETWEEN 2020 AND 2100),
+            total_days INTEGER NOT NULL,
+            milk_taken_days INTEGER NOT NULL,
+            total_amount REAL NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (user_id) REFERENCES users(user_id) ON DELETE CASCADE,
+            UNIQUE(user_id, month, year)
+        )
+    """)
+    
+    # Create indexes
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_milk_records_date 
+        ON milk_records(record_date)
+    """)
+    
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_milk_records_user_date 
+        ON milk_records(user_id, record_date)
+    """)
+    
+    cursor.execute("""
+        CREATE INDEX IF NOT EXISTS idx_monthly_summary_user 
+        ON monthly_summary(user_id, year, month)
+    """)
+    
+    # Insert default demo user if not exists
+    cursor.execute("SELECT COUNT(*) FROM users WHERE username = 'demo'")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("INSERT INTO users (username, password_hash) VALUES ('demo', 'demo')")
+    
+    conn.commit()
+    conn.close()
+
 # Database connection
 def get_db_connection():
     try:
-        conn = pyodbc.connect(
-            "DRIVER={ODBC Driver 17 for SQL Server};"
-            "SERVER=localhost;"
-            f"DATABASE={DATABASE_NAME};"
-            "UID=sa;"
-            "PWD=Admin@1234;"
-            "Encrypt=no;"
-            "TrustServerCertificate=yes;"
-        )
+        conn = sqlite3.connect(DATABASE_NAME)
+        conn.row_factory = sqlite3.Row  # Enable column access by name
         return conn
     except Exception as e:
         st.error(f"Database connection error: {e}")
@@ -52,13 +141,12 @@ def authenticate(username, password):
     if conn:
         try:
             cursor = conn.cursor()
-            # For demo purposes, allowing simple password. In production, use hash_password(password)
-            cursor.execute("SELECT user_id, password_hash FROM users WHERE username = ?", username)
+            cursor.execute("SELECT user_id, password_hash FROM users WHERE username = ?", (username,))
             result = cursor.fetchone()
             conn.close()
             
-            if result and result[1] == password:  # In production: hash_password(password)
-                return result[0]
+            if result and result['password_hash'] == password:
+                return result['user_id']
             return None
         except Exception as e:
             st.error(f"Authentication error: {e}")
@@ -71,10 +159,10 @@ def get_user_details(user_id):
     if conn:
         try:
             cursor = conn.cursor()
-            cursor.execute("SELECT username FROM users WHERE user_id = ?", user_id)
+            cursor.execute("SELECT username FROM users WHERE user_id = ?", (user_id,))
             result = cursor.fetchone()
             conn.close()
-            return result[0] if result else None
+            return result['username'] if result else None
         except Exception as e:
             st.error(f"Error fetching user details: {e}")
             return None
@@ -86,9 +174,11 @@ def update_password(user_id, new_password):
     if conn:
         try:
             cursor = conn.cursor()
-            # In production, use hash_password(new_password)
-            cursor.execute("UPDATE users SET password_hash = ?, updated_at = GETDATE() WHERE user_id = ?", 
-                         new_password, user_id)
+            cursor.execute("""
+                UPDATE users 
+                SET password_hash = ?, updated_at = CURRENT_TIMESTAMP 
+                WHERE user_id = ?
+            """, (new_password, user_id))
             conn.commit()
             conn.close()
             return True
@@ -104,7 +194,7 @@ def create_user(username, password):
         try:
             cursor = conn.cursor()
             cursor.execute("INSERT INTO users (username, password_hash) VALUES (?, ?)", 
-                         username, password)
+                         (username, password))
             conn.commit()
             conn.close()
             return True
@@ -120,13 +210,19 @@ def get_milk_records(user_id, month, year):
         try:
             query = """
             SELECT record_id, record_date, is_taken, base_cost, additional_cost, 
-                   total_cost, notes
+                   CASE WHEN is_taken = 1 THEN base_cost + additional_cost ELSE 0 END as total_cost,
+                   notes
             FROM milk_records
-            WHERE user_id = ? AND MONTH(record_date) = ? AND YEAR(record_date) = ?
+            WHERE user_id = ? AND strftime('%m', record_date) = ? AND strftime('%Y', record_date) = ?
             ORDER BY record_date
             """
-            df = pd.read_sql(query, conn, params=(user_id, month, year))
+            df = pd.read_sql_query(query, conn, params=(user_id, f"{month:02d}", str(year)))
             conn.close()
+            
+            # Convert record_date to datetime
+            if not df.empty:
+                df['record_date'] = pd.to_datetime(df['record_date'])
+            
             return df
         except Exception as e:
             st.error(f"Error fetching records: {e}")
@@ -144,10 +240,9 @@ def initialize_month_records(user_id, month, year):
             for day in range(1, num_days + 1):
                 record_date = datetime(year, month, day).date()
                 cursor.execute("""
-                    IF NOT EXISTS (SELECT 1 FROM milk_records WHERE user_id = ? AND record_date = ?)
-                    INSERT INTO milk_records (user_id, record_date, is_taken, base_cost, additional_cost)
+                    INSERT OR IGNORE INTO milk_records (user_id, record_date, is_taken, base_cost, additional_cost)
                     VALUES (?, ?, 1, 104.00, 0.00)
-                """, user_id, record_date, user_id, record_date)
+                """, (user_id, record_date))
             
             conn.commit()
             conn.close()
@@ -165,9 +260,9 @@ def update_milk_record(record_id, is_taken, additional_cost, notes):
             cursor = conn.cursor()
             cursor.execute("""
                 UPDATE milk_records 
-                SET is_taken = ?, additional_cost = ?, notes = ?, updated_at = GETDATE()
+                SET is_taken = ?, additional_cost = ?, notes = ?, updated_at = CURRENT_TIMESTAMP
                 WHERE record_id = ?
-            """, is_taken, additional_cost, notes, record_id)
+            """, (1 if is_taken else 0, additional_cost, notes, record_id))
             conn.commit()
             conn.close()
             return True
@@ -182,24 +277,47 @@ def calculate_monthly_summary(user_id, month, year):
     if conn:
         try:
             cursor = conn.cursor()
-            cursor.execute("EXEC sp_calculate_monthly_summary ?, ?, ?", user_id, month, year)
-            conn.commit()
             
+            # Calculate statistics from milk_records
             cursor.execute("""
-                SELECT total_days, milk_taken_days, total_amount
-                FROM monthly_summary
-                WHERE user_id = ? AND month = ? AND year = ?
-            """, user_id, month, year)
+                SELECT 
+                    COUNT(*) as total_days,
+                    SUM(CASE WHEN is_taken = 1 THEN 1 ELSE 0 END) as milk_taken_days,
+                    SUM(CASE WHEN is_taken = 1 THEN base_cost + additional_cost ELSE 0 END) as total_amount
+                FROM milk_records
+                WHERE user_id = ? 
+                    AND strftime('%m', record_date) = ? 
+                    AND strftime('%Y', record_date) = ?
+            """, (user_id, f"{month:02d}", str(year)))
             
             result = cursor.fetchone()
-            conn.close()
             
             if result:
+                total_days = result['total_days'] or 0
+                milk_taken_days = result['milk_taken_days'] or 0
+                total_amount = result['total_amount'] or 0
+                
+                # Upsert into monthly_summary
+                cursor.execute("""
+                    INSERT INTO monthly_summary (user_id, month, year, total_days, milk_taken_days, total_amount)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(user_id, month, year) 
+                    DO UPDATE SET 
+                        total_days = excluded.total_days,
+                        milk_taken_days = excluded.milk_taken_days,
+                        total_amount = excluded.total_amount
+                """, (user_id, month, year, total_days, milk_taken_days, total_amount))
+                
+                conn.commit()
+                conn.close()
+                
                 return {
-                    'total_days': result[0],
-                    'milk_taken_days': result[1],
-                    'total_amount': result[2]
+                    'total_days': total_days,
+                    'milk_taken_days': milk_taken_days,
+                    'total_amount': total_amount
                 }
+            
+            conn.close()
             return None
         except Exception as e:
             st.error(f"Error calculating summary: {e}")
@@ -208,17 +326,45 @@ def calculate_monthly_summary(user_id, month, year):
 
 # GROQ AI Assistant
 def ask_groq_assistant(question, context=""):
+    if not GROQ_AVAILABLE:
+        return """
+        ⚠️ **AI Assistant Unavailable**
+        
+        The GROQ library is not installed. To enable the AI Assistant:
+        
+        1. Add `groq` to your requirements.txt file
+        2. Get a GROQ API key from https://console.groq.com
+        3. Add it to Streamlit Cloud Secrets (Settings > Secrets):
+           ```
+           GROQ_API_KEY = "your_key_here"
+           ```
+        4. Redeploy the application
+        """
+    
+    if not GROQ_API_KEY:
+        return """
+        ⚠️ **GROQ API Key Not Configured**
+        
+        To use the AI Assistant:
+        
+        **For Streamlit Cloud:**
+        1. Get a GROQ API key from https://console.groq.com
+        2. Go to App Settings > Secrets
+        3. Add: `GROQ_API_KEY = "your_key_here"`
+        
+        **For Local Development:**
+        1. Create a `.env` file
+        2. Add: `GROQ_API_KEY=your_key_here`
+        """
+    
     try:
-        # Initialize Groq client
-        from groq import Client
-        client = Client(api_key=GROQ_API_KEY)
+        client = Groq(api_key=GROQ_API_KEY)
         
         system_prompt = f"""You are a helpful assistant for a milk calculation application.
         Context: {context}
         Help users with their questions about milk calculations, records, and monthly summaries.
         Provide clear, concise answers based on the context provided."""
         
-        # Create chat completion
         response = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
             messages=[
@@ -230,31 +376,8 @@ def ask_groq_assistant(question, context=""):
         )
         
         return response.choices[0].message.content
-    except ImportError:
-        # Fallback to alternative import
-        try:
-            client = Groq(api_key=GROQ_API_KEY)
-            
-            system_prompt = f"""You are a helpful assistant for a milk calculation application.
-            Context: {context}
-            Help users with their questions about milk calculations, records, and monthly summaries.
-            Provide clear, concise answers based on the context provided."""
-            
-            response = client.chat.completions.create(
-                model="llama-3.3-70b-versatile",
-                messages=[
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": question}
-                ],
-                temperature=0.7,
-                max_tokens=1024
-            )
-            
-            return response.choices[0].message.content
-        except Exception as e:
-            return f"AI Assistant Error: {str(e)}. Please check your GROQ_API_KEY and groq library version."
     except Exception as e:
-        return f"AI Assistant Error: {str(e)}. Please try: pip install --upgrade groq"
+        return f"AI Assistant Error: {str(e)}\n\nPlease verify your GROQ_API_KEY is correctly configured."
 
 # Login Page
 def login_page():
@@ -288,6 +411,8 @@ def login_page():
             if st.button("Register New User", use_container_width=True):
                 st.session_state.show_register = True
                 st.rerun()
+        
+        st.info("💡 Demo Login: Username: **demo** | Password: **demo**")
 
 # Registration Page
 def registration_page():
@@ -451,14 +576,29 @@ def user_settings_page():
 def ai_assistant_page():
     st.header("🤖 AI Assistant")
     
+    # Check if GROQ is available
+    if not GROQ_AVAILABLE:
+        st.error("⚠️ GROQ library not installed!")
+        st.info("""
+        To use the AI Assistant:
+        1. Add `groq` to your requirements.txt file
+        2. Get a GROQ API key from https://console.groq.com
+        3. Add it to Streamlit Cloud Secrets or local .env file
+        4. Redeploy the application
+        """)
+        return
+    
     # Check if GROQ API key is set
-    if not GROQ_API_KEY or GROQ_API_KEY == 'your_groq_api_key_here':
+    if not GROQ_API_KEY:
         st.error("⚠️ GROQ API Key not configured!")
         st.info("""
-        To use the AI Assistant, you need to:
-        1. Get a GROQ API key from https://console.groq.com
-        2. Set it as an environment variable: `GROQ_API_KEY=your_key_here`
-        3. Or edit the app.py file and replace 'your_groq_api_key_here' with your actual key
+        **For Streamlit Cloud:**
+        1. Go to App Settings > Secrets
+        2. Add: `GROQ_API_KEY = "your_key_here"`
+        
+        **For Local Development:**
+        1. Create a `.env` file
+        2. Add: `GROQ_API_KEY=your_key_here`
         """)
         return
     
@@ -511,6 +651,9 @@ def ai_assistant_page():
 # Main Application Flow
 def main():
     st.set_page_config(page_title="Milk Calculation App", page_icon="🥛", layout="wide")
+    
+    # Initialize database
+    init_database()
     
     # Initialize show_register state
     if 'show_register' not in st.session_state:
