@@ -381,6 +381,23 @@ def generate_excel_backup():
     output.seek(0)
     return output
 
+def delete_all_tables():
+    """Delete all data from users, milk_records, monthly_summary"""
+    conn = get_db_connection()
+    if conn:
+        try:
+            cursor = conn.cursor()
+            cursor.execute("DELETE FROM milk_records")
+            cursor.execute("DELETE FROM monthly_summary")
+            cursor.execute("DELETE FROM users")
+            conn.commit()
+            conn.close()
+            return True
+        except Exception as e:
+            st.error(f"Error deleting tables: {e}")
+            return False
+    return False
+
 # GROQ AI Assistant
 def ask_groq_assistant(question, context=""):
     if not GROQ_AVAILABLE:
@@ -537,6 +554,18 @@ def main_app():
         except Exception as e:
             st.error(f"❌ Error generating Excel: {str(e)}")
         
+        st.divider()
+
+        st.subheader("⚠️ Danger Zone")
+
+        if st.button("🗑️ Remove ALL Tables Data", use_container_width=True):
+            if delete_all_tables():
+                st.success("All tables (users, milk_records, monthly_summary) cleared successfully!")
+                st.session_state.logged_in = False
+                st.session_state.user_id = None
+                st.session_state.username = None
+                st.rerun()
+
         st.divider()
         
         if st.button("Logout", use_container_width=True):
