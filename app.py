@@ -4,7 +4,9 @@ import sqlite3
 from datetime import datetime, timedelta
 import calendar
 import hashlib
+import openpyxl
 import os
+from io import BytesIO
 
 # Load environment variables for local development
 try:
@@ -359,6 +361,26 @@ def calculate_monthly_summary(user_id, month, year):
             return None
     return None
 
+# Generate Excel backup
+def generate_excel_backup():
+    """Generate Excel file with all database tables"""
+    conn = sqlite3.connect(DATABASE_NAME)
+
+    users_df = pd.read_sql_query("SELECT * FROM users", conn)
+    milk_df = pd.read_sql_query("SELECT * FROM milk_records", conn)
+    summary_df = pd.read_sql_query("SELECT * FROM monthly_summary", conn)
+
+    conn.close()
+
+    output = BytesIO()
+    with pd.ExcelWriter(output, engine="openpyxl") as writer:
+        users_df.to_excel(writer, sheet_name="users", index=False)
+        milk_df.to_excel(writer, sheet_name="milk_records", index=False)
+        summary_df.to_excel(writer, sheet_name="monthly_summary", index=False)
+
+    output.seek(0)
+    return output
+
 # GROQ AI Assistant
 def ask_groq_assistant(question, context=""):
     if not GROQ_AVAILABLE:
@@ -497,7 +519,27 @@ def main_app():
         
         page = st.radio("Select Page", ["Monthly Records", "User Settings", "AI Assistant"])
         
-        if st.button("Logout"):
+        st.divider()
+        
+        # Excel Export Section
+        st.subheader("📥 Data Export")
+        
+        try:
+            excel_file = generate_excel_backup()
+            st.download_button(
+                label="📥 Download Excel Backup",
+                data=excel_file,
+                file_name=f"milk_database_backup_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key="download_excel"
+            )
+        except Exception as e:
+            st.error(f"❌ Error generating Excel: {str(e)}")
+        
+        st.divider()
+        
+        if st.button("Logout", use_container_width=True):
             st.session_state.logged_in = False
             st.session_state.user_id = None
             st.session_state.username = None
