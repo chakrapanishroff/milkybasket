@@ -275,10 +275,10 @@ def initialize_month_records(user_id, month, year, base_cost=None):
             
             for day in range(1, num_days + 1):
                 record_date = datetime(year, month, day).date()
-                # Set is_taken to 0 (False) by default - user must mark days they took milk
+                # Set is_taken to 1 (True) by default - all days checked, user unchecks days they didn't take milk
                 cursor.execute("""
                     INSERT OR IGNORE INTO milk_records (user_id, record_date, is_taken, base_cost, additional_cost)
-                    VALUES (?, ?, 0, ?, 0.00)
+                    VALUES (?, ?, 1, ?, 0.00)
                 """, (user_id, record_date, base_cost))
             
             conn.commit()
