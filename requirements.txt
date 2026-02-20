@@ -3,3 +3,5 @@ pandas>=2.0.0
 groq>=0.4.0
 python-dotenv>=1.0.0
 openpyxl
+numpy>=1.24.0
+matplotlib>=3.7.0
